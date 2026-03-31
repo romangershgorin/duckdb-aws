@@ -11,12 +11,135 @@
 #include <aws/core/client/ClientConfiguration.h>
 #include <aws/core/config/AWSConfigFileProfileConfigLoader.h>
 #include <aws/core/config/AWSProfileConfigLoaderBase.h>
+#include <aws/core/utils/json/JsonSerializer.h>
+#include <aws/core/utils/DateTime.h>
 #include <aws/identity-management/auth/STSAssumeRoleCredentialsProvider.h>
 #include <aws/sts/STSClient.h>
+#include <fstream>
+#include <sstream>
+#include <chrono>
+#include <mutex>
+#include <cstdlib>
 
 #include <sys/stat.h>
 
 namespace duckdb {
+
+//! Required helpers for Vault environment configuration
+static string GetEnvString(const string &name);
+
+//! Credentials provider that reads AWS credentials from a Vault-managed JSON file
+//! The file is re-read when credentials expire or are about to expire
+class VaultFileCredentialsProvider : public Aws::Auth::AWSCredentialsProvider {
+public:
+	//! Construct from explicit file path
+	explicit VaultFileCredentialsProvider(const string &file_path, int refresh_buffer_seconds = 60)
+		: file_path_(file_path), refresh_buffer_seconds_(refresh_buffer_seconds), out("/home/duckdbuser/log.txt", std::ios::app) {
+		RefreshCredentials();
+	}
+
+	//! Construct from role ARN - converts ARN to file path
+	static std::shared_ptr<VaultFileCredentialsProvider> FromRoleArn(const string &role_arn, int refresh_buffer_seconds = 60) {
+		string file_name = ArnToFileName(role_arn);
+		string file_path = GetEnvString("VAULT_CREDENTIALS_BASE_PATH") + file_name;
+		return std::make_shared<VaultFileCredentialsProvider>(file_path, refresh_buffer_seconds);
+	}
+
+	static string ArnToFileName(const string &arn) {
+		// Convert ARN like "arn:aws:iam::996495860105:role/bdx_roles/bdx_consumer_xxx"
+		// to filename "arn_aws_iam__996495860105_role_bdx_roles_bdx_consumer_xxx.json"
+		string result = arn;
+		for (char &c : result) {
+			if (c == ':' || c == '/' || c == '-') {
+				c = '_';
+			}
+		}
+		return result + ".json";
+	}
+
+	Aws::Auth::AWSCredentials GetAWSCredentials() override {
+		out << "GetAWSCredentials start\n";
+		std::lock_guard<std::mutex> lock(credentials_mutex_);
+		
+		// Check if credentials need refresh
+		auto now = std::chrono::system_clock::now();
+		if (now >= expiration_time_ - std::chrono::seconds(refresh_buffer_seconds_)) {
+			RefreshCredentials();
+		}
+		
+		out << "GetAWSCredentials end\n";
+		return credentials_;
+	}
+
+protected:
+	void RefreshCredentials() {
+		out << "RefreshCredentials start\n";
+		std::ifstream file(file_path_);
+		if (!file.is_open()) {
+			throw IOException("VaultFileCredentialsProvider: Failed to open credentials file: %s", file_path_);
+		}
+
+		std::stringstream buffer;
+		buffer << file.rdbuf();
+		string json_content = buffer.str();
+		file.close();
+
+		// Parse JSON using AWS SDK
+		Aws::Utils::Json::JsonValue json(json_content);
+		if (!json.WasParseSuccessful()) {
+			throw InvalidInputException("VaultFileCredentialsProvider: Failed to parse JSON in %s: %s", file_path_, json.GetErrorMessage());
+		}
+
+		auto view = json.View();
+		string access_key = view.KeyExists("access_key") ? view.GetString("access_key") : "";
+		string secret_key = view.KeyExists("secret_key") ? view.GetString("secret_key") : "";
+		string session_token = view.KeyExists("session_token") ? view.GetString("session_token") : "";
+		if (session_token.empty() && view.KeyExists("security_token")) {
+			session_token = view.GetString("security_token");
+		}
+		string expiration_str = view.KeyExists("expiration_time") ? view.GetString("expiration_time") : "";
+		int64_t ttl = view.KeyExists("ttl") ? view.GetInt64("ttl") : 0;
+
+		if (access_key.empty() || secret_key.empty()) {
+			throw InvalidInputException("VaultFileCredentialsProvider: Missing access_key or secret_key in %s", file_path_);
+		}
+
+		// Calculate expiration time
+		if (!expiration_str.empty()) {
+			expiration_time_ = ParseISO8601(expiration_str);
+		} else if (ttl > 0) {
+			expiration_time_ = std::chrono::system_clock::now() + std::chrono::seconds(ttl);
+		} else {
+			// Default: refresh in 1 hour
+			expiration_time_ = std::chrono::system_clock::now() + std::chrono::hours(1);
+		}
+
+		credentials_ = Aws::Auth::AWSCredentials(access_key.c_str(), secret_key.c_str(), session_token.c_str());
+		out << "RefreshCredentials end\n";
+	}
+
+private:
+	std::chrono::system_clock::time_point ParseISO8601(const string &timestamp) {
+		out << "ParseISO8601 start\n";
+		// Parse ISO8601 format using AWS SDK: "2026-02-02T19:29:29.372220969Z"
+		Aws::Utils::DateTime dt(timestamp, Aws::Utils::DateFormat::ISO_8601);
+		if (dt.WasParseSuccessful()) {
+			auto millis = dt.Millis();
+			return std::chrono::system_clock::time_point(std::chrono::milliseconds(millis));
+		}
+		// Fallback: 1 hour from now
+		out << "ParseISO8601 end\n";
+		return std::chrono::system_clock::now() + std::chrono::hours(1);
+	}
+
+	string file_path_;
+	int refresh_buffer_seconds_;
+	Aws::Auth::AWSCredentials credentials_;
+	std::chrono::system_clock::time_point expiration_time_;
+	std::mutex credentials_mutex_;
+
+	std::ofstream out;
+};
 
 //! We use a global here to store the path that is selected on the ICAPI::InitializeCurl call
 static string SELECTED_CURL_CERT_PATH;
@@ -61,6 +184,14 @@ static unique_ptr<KeyValueSecret> ConstructBaseS3Secret(vector<string> &prefix_p
 	auto return_value = make_uniq<KeyValueSecret>(prefix_paths_p, type, provider, name);
 	return_value->redact_keys = {"secret", "session_token"};
 	return return_value;
+}
+
+static string GetEnvString(const string &name) {
+	const char *value = std::getenv(name.c_str());
+	if (!value || *value == '\0') {
+		throw InvalidConfigurationException("Environment variable '%s' is required", name);
+	}
+	return string(value);
 }
 
 static Aws::Config::Profile GetProfile(const string &profile_name, const bool require_profile) {
@@ -128,6 +259,13 @@ public:
 				} else {
 					AddProvider(std::make_shared<Aws::Auth::ProcessCredentialsProvider>(profile.c_str()));
 				}
+			} else if (item == "vault") {
+				if (assume_role_arn.empty()) {
+					throw InvalidConfigurationException(
+					    "Chain value 'vault' is only supported with an ASSUME_ROLE_ARN value. "
+					    "If the selected profile uses vault, add \"CHAIN 'config'\"");
+				}
+				AddProvider(VaultFileCredentialsProvider::FromRoleArn(assume_role_arn));
 			} else if (item == "config") {
 				if (profile.empty()) {
 					AddProvider(std::make_shared<Aws::Auth::ProfileConfigFileAWSCredentialsProvider>());
